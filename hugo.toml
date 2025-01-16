@@ -1,0 +1,50 @@
+baseURL = "https://nandakumar-m.github.io/"
+languageCode = "en-us"
+title = "Nanda's tech blog"
+theme = "archie"
+
+copyright = "© Nandakumar M"
+# Code Highlight
+pygmentsstyle = "monokai"
+pygmentscodefences = true
+pygmentscodefencesguesssyntax = true
+
+#disqusShortname = "yourDisqusShortname"
+
+pagination.pagerSize = 3# articles per page
+
+[params]
+	mode="auto" # color-mode → light,dark,toggle or auto
+	useCDN=false # don't use CDNs for fonts and icons, instead serve them locally.
+	subtitle = "*I write on different aspects of software engineering like programming, databases, design patterns here...*"
+	#mathjax = true # enable MathJax support
+	#katex = true # enable KaTeX support
+
+# Social Tags
+
+[[params.social]]
+name = "GitHub"
+icon = "github"
+url = "https://github.com/Nandakumar-M"
+
+[[params.social]]
+name = "GitLab"
+icon = "gitlab"
+url = "https://gitlab.com/m.nanda92"
+
+# Main menu Items
+
+[[menu.main]]
+name = "Home"
+url = "/"
+weight = 1
+
+[[menu.main]]
+name = "All posts"
+url = "/posts"
+weight = 2
+
+[[menu.main]]
+name = "Tags"
+url = "/tags"
+weight = 4
