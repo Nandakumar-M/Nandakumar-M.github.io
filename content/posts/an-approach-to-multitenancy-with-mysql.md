@@ -37,7 +37,7 @@ AWS RDS for MySQL, for instance, recommends maximum of ten thousand tables per d
 >
 > We recommend having **fewer than 10,000** tables total across all of the databases in a DB instance. For a use case with a large number of tables in a MySQL database, see [One Million Tables in MySQL 8.0](https://www.percona.com/blog/2017/10/01/one-million-tables-MySQL-8-0/).
 
-**Refernce:** [Best practices for Amazon RDS
+**Reference:** [Best practices for Amazon RDS
 ](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html)
 
 ### 3. Shared schema
@@ -89,7 +89,7 @@ This data model ensures that *one tenant's department can never have another ten
 
 In MySQL (InnoDB), all tables are clustered by primary key. i.e. Primary key is a b+ tree which has the [PK value as key and the entire row as the value](https://www.percona.com/blog/tuning-innodb-primary-keys/). Secondary indexes are also b+ trees that have the indexed column's value as the key and the row's PK as value. Increasing the size of the PK will increase the size of the primary index as well as all secondary indexes on the table.
 
-When using composite primary keys, using `tinyint` for `tenant_id` column (1 byte extra), `256` tenants per schema. With `smallint` (2 bytes extra) we will be able to support up to `65K` tenants per schema.
+When using composite primary keys, using `tinyint`(1 byte) for `tenant_id` column, `256` tenants per schema can be supported. With `smallint`(2 bytes) we will be able to support up to `65K` tenants per schema.
 
 
 **Why is `tenant_id` the leading column of every primary key?**
@@ -102,7 +102,9 @@ This depends on the maximum number of rows we expect the table to hold per tenan
 
 ### Tenant Scoping
 
-How do we ensure that all application queries mandatorily filter on the `tenant_id` column? Postgres (*since version 9.5*) supports [Row Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html). With Postgres RLS,  it is [easy to implement](https://www.crunchydata.com/blog/row-level-security-for-tenants-in-postgres) [shared schema multi-tenancy](https://docs.aws.amazon.com/prescriptive-guidance/latest/saas-multitenant-managed-postgresql/rls.html) by creating a policy for each table which filters rows of a single tenant.
+How do we ensure that all application queries mandatorily filter on the `tenant_id` column? While there are approaches to implementing shared schema model in the application ([django](https://books.agiliq.com/projects/django-multi-tenant/en/latest/shared-database-shared-schema.html), [hibernate filters](https://callistaenterprise.se/blogg/teknik/2020/10/17/multi-tenancy-with-spring-boot-part5/), [hibernate 6 @TenantId](https://callistaenterprise.se/blogg/teknik/2023/05/22/multi-tenancy-with-spring-boot-part8/)), they all have limitations. For example, an implementation using hibernate would not handle native sql queries or when some other data access library like [JooQ](https://www.jooq.org/) is used by the application.
+
+Managing multi-tenancy centrally as part of the database would be much better. Postgres (*since version 9.5*) supports [Row Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html). With Postgres RLS,  it is [easy to implement](https://www.crunchydata.com/blog/row-level-security-for-tenants-in-postgres) [shared schema multi-tenancy](https://docs.aws.amazon.com/prescriptive-guidance/latest/saas-multitenant-managed-postgresql/rls.html) by creating a policy for each table which filters rows of a single tenant.
 
 The approach presented in the linked articles makes tenant scoping trivial for the application. However, **MySQL does not support row level security**. We will see how we can implement a similar solution without RLS in MySQL.
 
@@ -152,7 +154,7 @@ Also note the `with check option` clause. This ensures that insert/update statem
 
 With the updatable views, when application accesses data via the views, the tenant scoping is done automatically based on the `currentTenant` session variable. But, what if the application directly accesses the underlying table? In that case, we run the risk of application reading/writing data of all tenants.
 
-To solve this, we create two MySQL roles `data_owner` and `app_rw`. We create  two separate schemas - `data` and `app`. Tables are created in `data`  schema and views in `app` schema. We grant access to the `data` schema to `data_owner` role and `app` schema to `app_rw` role.
+To solve this, we create two MySQL roles `data_owner` and `app_rw`. We create  two separate schemas - `data` and `app`. Tables are created in `data`  schema and views in `app` schema. Access to `data` schema is granted to `data_owner` role and `app` schema to `app_rw` role.
 
 Applications use the `app_rw` role and so do not have access to the base tables directly. The **only way for applications to access data is via the views which have tenant scoping built-in**.
 
@@ -210,34 +212,170 @@ ALTER TABLE data.department ADD CONSTRAINT department_head_fk FOREIGN KEY (tenan
 ALTER TABLE data.user ADD CONSTRAINT user_reporting_manager_fk FOREIGN KEY (tenant_id, reporting_manager_id) REFERENCES user(tenant_id, id);
 
 CREATE FUNCTION data.current_tenant() RETURNS int DETERMINISTIC RETURN CAST(@currentTenant as signed int);
-
 ```
+
+Create the views in `app` schema. Note that we specify DEFINER as `data_owner` so that the view has access to the underlying table although the role `app_rw` may not have access to the tables.
+
+```sql
+CREATE DEFINER=data_owner ALGORITHM=MERGE VIEW app.department AS SELECT * FROM data.department WHERE tenant_id = data.current_tenant() WITH CHECK OPTION;
+CREATE DEFINER=data_owner ALGORITHM=MERGE VIEW app.user AS SELECT * FROM data.user WHERE tenant_id = data.current_tenant() WITH CHECK OPTION;
+```
+
 Optionally, we could also set up before insert triggers on the base tables so that, the `tenant_id` is automatically populated. This way, the application does not have to do anything related to multi-tenancy and everything is handled in MySQL itself.
 ```sql
 CREATE TRIGGER data.department_tenant BEFORE INSERT ON Department FOR EACH ROW SET new.tenant_id = data.current_tenant();
 
 CREATE TRIGGER data.user_tenant BEFORE INSERT ON User FOR EACH ROW SET new.tenant_id = data.current_tenant();
 ```
-### Example application using spring boot
-### Advantages
-- application is free to use any technology -- jooq, jpa, native query.
-- very few code changes for apps that are already using separate schema / database instance approach to be made into shared schema approach.
 
-### Limitations
-- on delete set null
-  - simulate using triggers
-- cannot use index hints
-  - should ideally not use index hints anyways
+### Example spring boot application
+
+Applications just have to set the current tenant's id  as a session variable. We can define a custom datasource `MTDataSource` which acts as a wrapper for the underlying data source. When application invokes `getConnection`, it gets the connection from acutal datasource and sets the current tenant id.
+
+```kotlin
+class MTDataSource(val actualDS: DataSource) : DataSource by actualDS {
+
+    override fun getConnection(): Connection {
+        var connection = actualDS.connection
+        var statement: PreparedStatement? = null
+        try {
+            statement = connection.prepareStatement("SET @currentTenant = ?")
+            val currentTenantId = TenantContext.getCurrentTenantId()
+            if(currentTenantId != null) {
+                statement.setInt(1, currentTenantId)
+                statement.execute()
+            }
+        } finally {
+            statement?.close()
+        }
+        return MTConnection(connection)
+    }
+}
+```
+
+The datasource returns a `MTConnection` instance, which is a wrapper for the connection returned by the actual data source. It resets the `currentTenant` when the connection is closed.
+```kotlin
+class MTConnection(val connection: Connection) : Connection by connection{
+    override fun close() {
+        var statement:Statement? = null
+            try{
+            statement = connection.createStatement()
+            statement.execute("SET @currentTenant = NULL")
+        } finally {
+            try {
+                statement?.close()
+            } catch (e: Exception){
+                e.printStackTrace()
+            }
+            connection.close()
+        }
+    }
+
+}
+```
+With this approach, the application models, repositories are defined as if it is a single tenant application.  A full example implementation using spring boot is available at [multi-tenant-ticketing-sample](https://github.com/Nandakumar-M/multi-tenant-ticketing-sample).
+
 
 ### Performance
-- query plan uses index for FK
-- query plan uses index for sorting
-- query plan does not scan whole table even when there are no useful indexes.
 
-### Other considerations
-- delete one tenant's data
-- rebalancing shards
-- schema migrations
-  - use data_owner_role
-  - replace views
-- sequence generator
+Our multi-tenancy architecture is essentially built on MySQL views. How are views processed by MySQL? 
+
+There are two [view processing algorithms](https://dev.mysql.com/doc/refman/8.0/en/view-algorithms.html) in MySQL.
+1. MERGE
+2. TEMPTABLE
+
+With `MERGE` algorithm (which we specified in our create view statements), the criteria of the view definition is merged into the outer query. For example, a query 
+```sql
+select * from app.department where id = 1;
+```
+that references the view `app.department` gets converted into 
+```sql
+select * from data.department where tenant_id = current_tenant() and id = 1;
+```
+The MySQL [Optimizing Derived Tables, View References, and Common Table Expressions with Merging or Materialization](https://dev.mysql.com/doc/refman/8.0/en/derived-table-optimization.html) page says the following.
+
+> The optimizer handles derived tables, view references, and common table expressions the same way: It avoids unnecessary materialization whenever possible, which enables pushing down conditions from the outer query to derived tables and produces more efficient execution plans. (For an example, see Section 10.2.2.2, “Optimizing Subqueries with Materialization”.)
+> 
+> If merging would result in an outer query block that references more than **61 base tables**, the optimizer chooses materialization instead.
+
+Although MySQL does not support creating indexes on views, with MERGE algorithm, the indexes on the base tables are used by the query planner.
+
+By populating the example application database with dummy data for several hundred tenants, we can check the query plans and verify that the primary and secondary indexes are getting utilized.
+
+```sql
+mysql> set @currTenant=229;
+Query OK, 0 rows affected (0.01 sec)
+
+mysql> explain analyze select * from ticket where priorityId =1 and impactId=1 and categoryId=1;
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| EXPLAIN                                                                                                                                                                                                                              |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| -> Filter: ((data.ticket.tenantId = <cache>(data.current_tenant())) and (data.ticket.categoryId = 1) and (data.ticket.impactId = 1) and (data.ticket.priorityId = 1))  (cost=4371 rows=329) (actual time=2.32..139 rows=82 loops=1)
+    -> Intersect rows sorted by row ID  (cost=4371 rows=3287) (actual time=0.498..135 rows=20583 loops=1)
+        -> Index range scan on ticket using ticket_impact_fk over (tenantId = 229 AND impactId = 1)  (cost=171 rows=109576) (actual time=0.32..14.6 rows=56797 loops=1)
+        -> Index range scan on ticket using ticket_priority_fk over (tenantId = 229 AND priorityId = 1)  (cost=707 rows=456146) (actual time=0.12..48.3 rows=258350 loops=1)
+|
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+1 row in set (0.15 sec)
+
+mysql> set @currTenant=20;
+Query OK, 0 rows affected (0.01 sec)
+
+
+mysql> explain analyze select * from ticket where priorityId =1 and impactId=1 and categoryId=1;
++-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| EXPLAIN                                                                                                                                                                                                                           |
++-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| -> Filter: ((data.ticket.tenantId = <cache>(data.current_tenant())) and (data.ticket.categoryId = 1) and (data.ticket.impactId = 1) and (data.ticket.priorityId = 1))  (cost=10.7 rows=0.1) (actual time=1.62..18 rows=9 loops=1)
+    -> Intersect rows sorted by row ID  (cost=10.7 rows=1) (actual time=1.07..17.8 rows=74 loops=1)
+        -> Index range scan on ticket using ticket_priority_fk over (tenantId = 20 AND priorityId = 1)  (cost=3.58 rows=1684) (actual time=0.617..0.955 rows=1684 loops=1)
+        -> Index range scan on ticket using ticket_impact_fk over (tenantId = 20 AND impactId = 1)  (cost=7.06 rows=3914) (actual time=0.335..1.01 rows=3912 loops=1)
+|
++-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+1 row in set (0.08 sec)
+```
+
+```sql
+mysql> explain analyze select u1_0.userId,a1_0.accountId,am1_0.userId,am1_0.accountId,am1_0.activated,am1_0.createdTime,am1_0.businessFunctionId,am1_0.email,am1_0.name,am1_0.reportingManagerId,am1_0.siteId,a1_0.createdTime,a1_0.deletedTime,hs1_0.id,hs1_0.accountId,hs1_0.deletedTime,hs1_0.hq,hs1_0.name,hs1_0.working24x7,a1_0.name,a1_0.stageId,a1_0.updatedTime,u1_0.activated,u1_0.createdTime,d2_0.businessFunctionId,d2_0.deletedTime,h1_0.userId,h1_0.accountId,h1_0.activated,h1_0.createdTime,h1_0.businessFunctionId,h1_0.email,h1_0.name,h1_0.reportingManagerId,h1_0.siteId,d2_0.name,u1_0.email,u1_0.name,rm3_0.userId,a5_0.accountId,a5_0.accountManagerId,a5_0.createdTime,a5_0.deletedTime,a5_0.hqSiteId,a5_0.name,a5_0.stageId,a5_0.updatedTime,rm3_0.activated,rm3_0.createdTime,d4_0.businessFunctionId,d4_0.deletedTime,d4_0.headId,d4_0.name,rm3_0.email,rm3_0.name,rm3_0.reportingManagerId,s3_0.id,s3_0.accountId,s3_0.deletedTime,s3_0.hq,s3_0.name,s3_0.working24x7,s4_0.id,a7_0.accountId,a7_0.accountManagerId,a7_0.createdTime,a7_0.deletedTime,a7_0.hqSiteId,a7_0.name,a7_0.stageId,a7_0.updatedTime,s4_0.deletedTime,s4_0.hq,s4_0.name,s4_0.working24x7 from User u1_0 left join Account a1_0 on a1_0.accountId=u1_0.accountId left join User am1_0 on am1_0.userId=a1_0.accountManagerId left join Site hs1_0 on hs1_0.id=a1_0.hqSiteId left join businessfunction d2_0 on d2_0.businessFunctionId=u1_0.businessFunctionId left join User h1_0 on h1_0.userId=d2_0.headId left join User rm3_0 on rm3_0.userId=u1_0.reportingManagerId left join Account a5_0 on a5_0.accountId=rm3_0.accountId left join businessfunction d4_0 on d4_0.businessFunctionId=rm3_0.businessFunctionId left join Site s3_0 on s3_0.id=rm3_0.siteId left join Site s4_0 on s4_0.id=u1_0.siteId left join Account a7_0 on a7_0.accountId=s4_0.accountId where u1_0.userId=205;
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| EXPLAIN                                                                                                                                                                                                                            |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| -> Nested loop left join  (cost=10.5 rows=1) (actual time=0.302..0.304 rows=1 loops=1)
+    -> Nested loop left join  (cost=9.36 rows=1) (actual time=0.283..0.285 rows=1 loops=1)
+        -> Nested loop left join  (cost=8.27 rows=1) (actual time=0.282..0.284 rows=1 loops=1)
+            -> Nested loop left join  (cost=7.18 rows=1) (actual time=0.277..0.278 rows=1 loops=1)
+                -> Nested loop left join  (cost=6.83 rows=1) (actual time=0.248..0.249 rows=1 loops=1)
+                    -> Nested loop left join  (cost=5.74 rows=1) (actual time=0.225..0.226 rows=1 loops=1)
+                        -> Nested loop left join  (cost=4.67 rows=1) (actual time=0.2..0.201 rows=1 loops=1)
+                            -> Nested loop left join  (cost=3.6 rows=1) (actual time=0.175..0.176 rows=1 loops=1)
+                                -> Nested loop left join  (cost=3.25 rows=1) (actual time=0.139..0.139 rows=1 loops=1)
+                                    -> Nested loop left join  (cost=2.16 rows=1) (actual time=0.0998..0.1 rows=1 loops=1)
+                                        -> Nested loop left join  (cost=1.1 rows=1) (actual time=0.0648..0.0651 rows=1 loops=1)
+                                            -> Rows fetched before execution  (cost=0..0 rows=1) (actual time=84e-6..126e-6 rows=1 loops=1)
+                                            -> Single-row index lookup on account using PRIMARY (tenantId=data.current_tenant(), accountId='16')  (cost=1.1 rows=1) (actual time=0.0544..0.0544 rows=1 loops=1)
+                                        -> Single-row index lookup on user using PRIMARY (tenantId=data.current_tenant(), userId=data.`account`.accountManagerId)  (cost=1.07 rows=1) (actual time=0.0343..0.0344 rows=1 loops=1)
+                                    -> Single-row index lookup on site using PRIMARY (tenantId=data.current_tenant(), id=data.`account`.hqSiteId)  (cost=1.09 rows=1) (actual time=0.0384..0.0384 rows=1 loops=1)
+                                -> Single-row index lookup on businessfunction using PRIMARY (tenantId=data.current_tenant(), businessFunctionId='75')  (cost=0.35 rows=1) (actual time=0.0364..0.0364 rows=1 loops=1)
+                            -> Single-row index lookup on user using PRIMARY (tenantId=data.current_tenant(), userId=data.businessfunction.headId)  (cost=1.07 rows=1) (actual time=0.0246..0.0247 rows=1 loops=1)
+                        -> Single-row index lookup on user using PRIMARY (tenantId=data.current_tenant(), userId='45')  (cost=1.07 rows=1) (actual time=0.0241..0.0242 rows=1 loops=1)
+                    -> Single-row index lookup on account using PRIMARY (tenantId=data.current_tenant(), accountId=data.`user`.accountId)  (cost=1.1 rows=1) (actual time=0.0226..0.0226 rows=1 loops=1)
+                -> Single-row index lookup on businessfunction using PRIMARY (tenantId=data.current_tenant(), businessFunctionId=data.`user`.businessFunctionId)  (cost=0.35 rows=1) (actual time=0.0288..0.0289 rows=1 loops=1)
+            -> Single-row index lookup on site using PRIMARY (tenantId=data.current_tenant(), id=data.`user`.siteId)  (cost=1.09 rows=1) (actual time=0.00442..0.00442 rows=0 loops=1)
+        -> Single-row index lookup on site using PRIMARY (tenantId=data.current_tenant(), id=NULL)  (cost=1.09 rows=1) (actual time=0.00125..0.00125 rows=0 loops=1)
+    -> Single-row index lookup on account using PRIMARY (tenantId=data.current_tenant(), accountId=data.site.accountId)  (cost=1.1 rows=1) (actual time=0.00971..0.00971 rows=0 loops=1)
+|
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+1 row in set (0.03 sec)
+```
+
+
+### Limitations
+There are a few limitations in our approach.
+
+1. Foreign key action `ON DELETE SET NULL` sets all the FK columns to `NULL` in case of composite FKs. i.e. When a user referenced in department table using (`tenant_id`, `head_id`) is deleted, MySQL tries to set both `tenant_id` and `head_id` to `NULL` which violates the NOT NULL constraint on the `tenant_id` column. We can workaround this by creating BEFORE DELETE triggers on user table.
+2. Since there are no indexes for views, application queries cannot have index hints.
+3. Statement-based binary logging and replication cannot be used as our queries uses `current_tenant` function which relies on session variable. Row based binary logging and replication is possible.
+
+## Conclusion
+
+We have seen an efficient and scalable approach to implementing multi-tenancy with MySQL. This approach has the added advantage that it can be employed in the case of an application that currently uses separate schema approach to multi-tenancy with minimal code changes.
