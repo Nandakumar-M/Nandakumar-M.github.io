@@ -9,7 +9,7 @@ In this article, I present an approach to implement a scalable multi-tenancy arc
 
 ## Introduction
 
-A SaaS provider typically handles multiple customers. Each customer is a **tenant** from the point of view of the provider. The SaaS provider is responsible for ensuring separation between tenants. The fundamental requirement is that data of one tenant should not be accessible to other tenants.
+A SaaS provider typically handles multiple customers. Each customer is a **tenant** from the point of view of the provider. The SaaS provider is responsible for isolating tenant data and operations, ensuring that one tenant's data remains inaccessible to other tenants.
 
 A key aspect of designing the multi-tenancy architecture  for a web service is **tenant scoping**. i.e. How does the application scope its requests to a particular tenant at a time? The application's context (logged in user in case of a API request), helps us identify the currently active tenant.
 
@@ -17,13 +17,13 @@ There are various multi-tenancy architectures which provide different trade-offs
 
 
 ### 1. Database instance per tenant
-In this approach, each tenant gets their own database instance with separate resources (CPU / memory). This provides the highest levels of tenant separation - even a performance degradation in one tenant’s database instance does not impact other tenants.
+In this approach, each tenant gets their own database instance with separate resources (CPU / memory). This provides the highest levels of separation - even a performance degradation in one tenant’s database instance does not impact other tenants.
 
 For applications, tenant scoping is achieved simply by connecting to the current tenant’s database instance.
 
 However, this approach is **impractical in most cases** due to higher infrastructure costs and management overhead (spinning up new database instances for every new customer).
 ### 2. Schema per tenant
-In this approach, we use shared database instance(s) and each tenant gets their own separate schema (or database).
+In this approach, we use shared database instance(s) and each tenant gets a separate schema (or database).
 
 For applications, tenant scoping is as easy as connecting to the current tenant’s schema. Because the database engine resources (CPU / memory) are shared across tenants, it is possible that costly application queries from one tenant could impact other tenants that share the same database instance.
 
@@ -41,9 +41,9 @@ AWS RDS for MySQL, for instance, recommends maximum of ten thousand tables per d
 ](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html)
 
 ### 3. Shared schema
-In this approach, multiple tenants are mapped to a single schema (or database) and so their data are stored in a set of shared tables. This approach scales better for larger number of tenants as we can pack hundreds or thousands of tenants in a single schema. However, it comes with its **own set of challenges**.
+In this approach, multiple tenants are mapped to a single schema (or database) and so their data are stored in a set of shared tables. This approach scales better for larger number of tenants as we can pack hundreds or thousands of tenants in a single schema. However, it comes with its own set of challenges.
 
-Since the tables are shared across tenants, each row should be mapped to its tenant in some way. For the application, tenant scoping is no longer straight-forward as every database query now needs to filter for the current tenant’s rows only.
+Since the tables are shared across tenants, each row should be mapped to its tenant in some way. For the application, tenant scoping is no longer straight-forward as every query now needs to filter for the current tenant’s rows only.
 
 Shared schema also results in much larger table sizes compared to the first two approaches and poses a challenge of how to make sure the database engine efficiently processes application queries.
 
@@ -87,9 +87,11 @@ This data model ensures that *one tenant's department can never have another ten
 
 **Why is `tenant_id`'s type `smallint`?**
 
-In MySQL (InnoDB), all tables are clustered by primary key. i.e. Primary key is a b+ tree which has the [PK value as key and the entire row as the value](https://www.percona.com/blog/tuning-innodb-primary-keys/). Secondary indexes are also b+ trees that have the indexed column's value as the key and the row's PK as value. Increasing the size of the PK will increase the size of the primary index as well as all secondary indexes on the table.
+In MySQL (InnoDB), all tables are clustered by primary key. i.e. Primary key is a b+ tree which has the [PK value as key and the entire row as the value](https://www.percona.com/blog/tuning-innodb-primary-keys/). Secondary indexes are also b+ trees that have the indexed column's value as the key and the row's PK as value.
 
-When using composite primary keys, using `tinyint`(1 byte) for `tenant_id` column, `256` tenants per schema can be supported. With `smallint`(2 bytes) we will be able to support up to `65K` tenants per schema.
+Increasing the size of the PK will increase the size of the primary index as well as all secondary indexes on the table.
+
+When using composite primary keys, using `tinyint`(1 byte) for `tenant_id` column, 256 tenants per schema can be supported. With `smallint`(2 bytes) we will be able to support up to 65K tenants per schema.
 
 
 **Why is `tenant_id` the leading column of every primary key?**
@@ -148,7 +150,7 @@ Query OK, 0 rows affected (0.04 sec)
 ```
 The view created here references only a single table and does not have any aggregate function in its select query, hence it is an **updatable view**. i.e. We can execute DML(insert, update, delete) statements on the view and they will automatically be propagated to the underlying table. 
 
-Also note the `with check option` clause. This ensures that insert/update statements cannot insert/update rows that will violate the view definition criteria. i.e. `tenant_id` cannot be set to any other value other than `currentTenant` value.
+Also note the `with check option` clause. This ensures that DML statements cannot insert/update rows that will violate the view definition criteria. i.e. `tenant_id` cannot be set to any other value other than `currentTenant` value.
 
 #### Restricting access to base tables
 
@@ -224,7 +226,6 @@ CREATE DEFINER=data_owner ALGORITHM=MERGE VIEW app.user AS SELECT * FROM data.us
 Optionally, we could also set up before insert triggers on the base tables so that, the `tenant_id` is automatically populated. This way, the application does not have to do anything related to multi-tenancy and everything is handled in MySQL itself.
 ```sql
 CREATE TRIGGER data.department_tenant BEFORE INSERT ON Department FOR EACH ROW SET new.tenant_id = data.current_tenant();
-
 CREATE TRIGGER data.user_tenant BEFORE INSERT ON User FOR EACH ROW SET new.tenant_id = data.current_tenant();
 ```
 
