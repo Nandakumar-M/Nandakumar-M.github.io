@@ -5,7 +5,7 @@ tags = ['MySQL','multi-tenancy','spring-boot']
 title = 'Multi-tenancy with MySQL'
 +++
 
-In this article, I present an approach to implement a scalable multi-tenancy architecture with MySQL. The example shown here uses Spring Boot, however, the concepts are general and can be implemented in other programming languages / frameworks.
+In this article, I present an approach to implement a scalable multi-tenancy architecture with MySQL. The [example shown here uses Spring Boot](https://github.com/Nandakumar-M/multi-tenant-ticketing-sample), however, the concepts are general and can be implemented in other programming languages / frameworks.
 
 ## Introduction
 
